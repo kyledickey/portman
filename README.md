@@ -137,7 +137,7 @@ portman keeps all of its files in one directory:
 | ------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------- |
 | `pm list` says portman isn't running.                        | Run `pm start`. If it still isn't running, run `pm logs` to see why.                                                         |
 | `pm list` says another program is using port 80.             | Stop that program, or choose another port in `pm config`. URLs then include the port, such as `http://api.localhost:8080`.   |
-| `bind: permission denied`                                    | Ports below 1024 need extra rights. `pm start` grants them to the service. On Linux, `pm serve` asks for sudo to grant them. |
+| `bind: permission denied`                                    | Ports below 1024 need extra rights. `pm start` asks for sudo and grants them to the service: on macOS it runs as a root LaunchDaemon. On Linux, `pm serve` asks for sudo too. |
 | `portman is already running`                                 | Another portman holds the port. Watch it with `pm logs -f`, or stop it with `pm stop`.                                       |
 | The browser shows "isn't responding".                        | portman matched the name, but nothing answered on the app's port. Start the app, or check the port with `pm list`.           |
 | The browser shows "isn't mapped".                            | No app has that name. Run `pm list` to see the names that exist.                                                             |

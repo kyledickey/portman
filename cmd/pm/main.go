@@ -58,10 +58,10 @@ func appURL(c config.Config, name string) string {
 	return "http://" + host
 }
 
-// asRoot reruns this command under sudo on Linux, where the system service
-// needs root. It reports whether it reran.
+// asRoot reruns this command under sudo on Linux and macOS, where the system
+// service needs root. It reports whether it reran.
 func asRoot(cmd *cli.Command) (bool, error) {
-	if runtime.GOOS != "linux" || os.Geteuid() == 0 {
+	if (runtime.GOOS != "linux" && runtime.GOOS != "darwin") || os.Geteuid() == 0 {
 		return false, nil
 	}
 	exe, err := os.Executable()

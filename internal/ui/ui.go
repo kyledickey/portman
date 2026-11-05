@@ -112,3 +112,12 @@ var Theme = huh.ThemeFunc(func(isDark bool) *huh.Styles {
 	t.Blurred.PrevIndicator = lipgloss.NewStyle()
 	return t
 })
+
+// HintOf returns the hint attached to err with Hint, or "".
+func HintOf(err error) string {
+	var h hinted
+	if errors.As(err, &h) {
+		return h.hint
+	}
+	return ""
+}

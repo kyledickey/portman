@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -292,4 +293,22 @@ func (s *syncBuffer) String() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.b.String()
+}
+
+func TestStartFailureReadsServiceLog(t *testing.T) {
+	path := t.TempDir() + "/pm.log"
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logStartFailure(f, ui.Hint(errors.New("bind: permission denied"), "pick a port above 1023"))
+	f.Close()
+
+	if err := startFailure(path, time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("old failures should be ignored, got %v", err)
+	}
+	err = startFailure(path, time.Now().Add(-time.Minute))
+	if err == nil || !strings.Contains(err.Error(), "permission denied") || ui.HintOf(err) != "pick a port above 1023" {
+		t.Fatalf("got %v (hint %q)", err, ui.HintOf(err))
+	}
 }

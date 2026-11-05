@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"os/exec"
@@ -39,20 +42,41 @@ WantedBy=multi-user.target
 `
 
 func newService(dir string, d *daemon) (service.Service, error) {
+	var user string
+	if runtime.GOOS == "linux" {
+		// Run as whoever ran sudo so files in dir stay theirs. The unit grants
+		// low ports. macOS has no such grant, so its LaunchDaemon runs as root.
+		user = os.Getenv("SUDO_USER")
+	}
 	return service.New(d, &service.Config{
 		Name:        "portman",
 		DisplayName: "portman",
 		Description: "Maps NAME.localhost to local ports",
 		Arguments:   []string{"serve", "--home", dir},
-		// On Linux, run as whoever ran sudo so files in dir stay theirs.
-		UserName: os.Getenv("SUDO_USER"),
+		UserName:    user,
 		Option: service.KeyValue{
 			"SystemdScript": unit,
-			"UserService":   runtime.GOOS == "darwin",
 			"RunAtLoad":     true,
 			"OnFailure":     "restart",
 		},
 	})
+}
+
+// dropLaunchAgent removes the per-user LaunchAgent that portman v0.1.0 used on
+// macOS. A LaunchAgent can't bind port 80, so portman now uses a LaunchDaemon.
+// It reports whether there was one.
+func dropLaunchAgent() bool {
+	if runtime.GOOS != "darwin" || os.Geteuid() == 0 {
+		return false
+	}
+	s, err := service.New(&daemon{}, &service.Config{Name: "portman", Option: service.KeyValue{"UserService": true}})
+	if err != nil {
+		return false
+	}
+	if _, err := s.Status(); errors.Is(err, service.ErrNotInstalled) {
+		return false
+	}
+	return s.Uninstall() == nil
 }
 
 type daemon struct {
@@ -65,7 +89,12 @@ type daemon struct {
 func (d *daemon) Start(s service.Service) error {
 	stop, err := proxy.Start(d.dir, version, d.logw)
 	if err != nil {
-		return explain(err)
+		err = explain(err)
+		if !service.Interactive() {
+			// The service's stderr goes where pm logs doesn't look.
+			logStartFailure(d.logw, err)
+		}
+		return err
 	}
 	d.stop = stop
 	if service.Interactive() {
@@ -86,6 +115,9 @@ func explain(err error) error {
 	case errors.Is(err, proxy.ErrRunning):
 		return ui.Hint(err, "watch it with pm logs -f, or stop it with pm stop")
 	case strings.Contains(msg, "permission denied"):
+		if !service.Interactive() {
+			return ui.Hint(err, "the service can't bind this port: pick a port above 1023 with pm config, then run pm start")
+		}
 		return ui.Hint(err, "ports below 1024 need pm start, or pick a higher port with pm config")
 	case strings.Contains(msg, "address already in use"), strings.Contains(msg, "Only one usage"):
 		return ui.Hint(err, "another program has this port: stop it, or pick another port with pm config")
@@ -106,6 +138,9 @@ var serveCmd = &cli.Command{
 			if rerun, err := withBindRights(cmd, c); rerun {
 				return err
 			}
+		}
+		if err := shareLog(dir); err != nil {
+			return err
 		}
 		lj := &lumberjack.Logger{Filename: config.LogFile(dir), MaxSize: 10, MaxBackups: 3}
 		defer lj.Close()
@@ -154,10 +189,16 @@ var startCmd = &cli.Command{
 	Name:  "start",
 	Usage: "run portman in the background, now and whenever your machine starts",
 	Action: func(ctx context.Context, cmd *cli.Command) error {
+		dir := cmd.String("home")
+		// Create dir as you, so a root service doesn't make it root's.
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+		dropLaunchAgent()
 		if rerun, err := asRoot(cmd); rerun {
 			return err
 		}
-		dir := cmd.String("home")
+		began := time.Now()
 		s, err := newService(dir, &daemon{})
 		if err != nil {
 			return err
@@ -185,6 +226,9 @@ var startCmd = &cli.Command{
 			}
 			time.Sleep(100 * time.Millisecond)
 		}
+		if err := startFailure(config.LogFile(dir), began); err != nil {
+			return err
+		}
 		return ui.Hint(fmt.Errorf("portman started but isn't answering on port %d", c.Port), "see why with pm logs")
 	},
 }
@@ -199,7 +243,12 @@ var stopCmd = &cli.Command{
 			return err
 		}
 		out := cmd.Root().Writer
+		dropped := dropLaunchAgent()
 		if _, err := s.Status(); errors.Is(err, service.ErrNotInstalled) {
+			if dropped {
+				ui.Success(out, "portman stopped")
+				return nil
+			}
 			if c, err := config.Load(dir); err == nil {
 				if _, err := proxy.Probe(c.Port); err == nil {
 					ui.Info(out, "portman is running in the foreground: press ctrl+c where pm serve runs")
@@ -226,4 +275,39 @@ func elevated(err error) error {
 		return ui.Hint(err, "Windows services need an Administrator terminal: right-click your terminal, Run as administrator")
 	}
 	return err
+}
+
+// logStartFailure records why the service couldn't start in pm.log, where
+// pm logs and pm start look for it.
+func logStartFailure(w io.Writer, err error) {
+	args := []any{}
+	if h := ui.HintOf(err); h != "" {
+		args = append(args, "hint", h)
+	}
+	slog.New(slog.NewJSONHandler(w, nil)).Error(err.Error(), args...)
+}
+
+// startFailure returns the newest startup error logged since began, if any.
+func startFailure(path string, began time.Time) error {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var found error
+	for _, line := range bytes.Split(b, []byte("\n")) {
+		var e struct {
+			Time  time.Time
+			Level string
+			Msg   string
+			Hint  string
+		}
+		if json.Unmarshal(line, &e) != nil || e.Level != "ERROR" || e.Time.Before(began) {
+			continue
+		}
+		if e.Hint == "" {
+			e.Hint = "see more with pm logs"
+		}
+		found = ui.Hint(fmt.Errorf("portman couldn't start: %s", e.Msg), "%s", e.Hint)
+	}
+	return found
 }
