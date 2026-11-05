@@ -11,6 +11,8 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/user"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -62,18 +64,24 @@ func newService(dir string, d *daemon) (service.Service, error) {
 	})
 }
 
-// dropLaunchAgent removes the per-user LaunchAgent that portman v0.1.0 used on
+// dropLaunchAgent removes the LaunchAgent that portman v0.1.0 installed on
 // macOS. A LaunchAgent can't bind port 80, so portman now uses a LaunchDaemon.
+// v0.1.0 run with sudo put its agent in root's home, which launchd loads into
+// the system domain under the same label, so this runs both as you and as root.
 // It reports whether there was one.
 func dropLaunchAgent() bool {
-	if runtime.GOOS != "darwin" || os.Geteuid() == 0 {
+	if runtime.GOOS != "darwin" {
+		return false
+	}
+	u, err := user.Current()
+	if err != nil {
+		return false
+	}
+	if _, err := os.Stat(filepath.Join(u.HomeDir, "Library", "LaunchAgents", "portman.plist")); err != nil {
 		return false
 	}
 	s, err := service.New(&daemon{}, &service.Config{Name: "portman", Option: service.KeyValue{"UserService": true}})
 	if err != nil {
-		return false
-	}
-	if _, err := s.Status(); errors.Is(err, service.ErrNotInstalled) {
 		return false
 	}
 	return s.Uninstall() == nil
